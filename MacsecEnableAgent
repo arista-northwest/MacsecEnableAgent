@@ -1,0 +1,200 @@
+#!/usr/bin/env python2
+
+import sys
+import re
+import os
+
+import eossdk
+
+from PyClient import PyClient
+
+import Logging
+import Tac
+
+__version__ = "0.1.0"
+
+LOGFILE = "/var/log/MacsecEnableAgent.log"
+INTF_RE = re.compile(r"Ethernet(?P<linecard>\d+).*")
+DEFAULT_MACSEC_PROFILE = "DEFAULT"
+DEFAULT_WATCH_LINECARDS = "3 4 5"
+
+Tac.singleton( "Tac::LogManager" ).syslogFacility = 'logLocal4'
+
+Logging.logD(id="SYS_EVENT_MACSECENABLER_INFO",
+             severity=Logging.logInfo,
+             format="%s",
+             explanation="[ ]",
+             recommendedAction=Logging.NO_ACTION_REQUIRED)
+
+Logging.logD(id="SYS_EVENT_MACSECENABLER_NOTICE",
+             severity=Logging.logNotice,
+             format="%s",
+             explanation="[ ]",
+             recommendedAction=Logging.NO_ACTION_REQUIRED)
+
+Logging.logD(id="SYS_EVENT_MACSECENABLER_WARN",
+             severity=Logging.logWarning,
+             format="%s",
+             explanation="[ ]",
+             recommendedAction=Logging.NO_ACTION_REQUIRED)
+
+Logging.logD(id="SYS_EVENT_MACSECENABLER_ERROR",
+             severity=Logging.logError,
+             format="%s",
+             explanation="[ ]",
+             recommendedAction=Logging.NO_ACTION_REQUIRED)
+#END - SETTINGS
+
+class MacsecEnableAgent(eossdk.AgentHandler, eossdk.IntfHandler):
+    def __init__(self, sdk):
+        self.tracer = eossdk.Tracer("MacsecEnableAgent")
+
+        self.macsec_profile = ""
+        self.watch_linecards = []
+
+        self.agent_mgr = sdk.get_agent_mgr()
+        self.intf_mgr = sdk.get_intf_mgr()
+        self.eapi_mgr = sdk.get_eapi_mgr()
+
+        self.py_client = PyClient('ar', 'Sysdb')
+        self.macsec_status = self.py_client.agentRoot()['macsec']['status']
+
+        eossdk.IntfHandler.__init__(self, self.intf_mgr)
+        eossdk.AgentHandler.__init__(self, self.agent_mgr)
+
+    @property
+    def idle(self):
+        return True if self.agent_mgr.status("idle") else False
+    
+    @idle.setter
+    def idle(self, state):
+        if state:
+            self.agent_mgr.status_set("idle", "1")
+        else:
+            self.agent_mgr.status_del("idle")
+
+    # def _macsec_enabled(self):
+    #     return self.macsec_status.macsecEnabled
+    
+    def _get_macsec_profile(self, intf):
+        profile = ""
+        
+        intf_status = self.macsec_status.intfStatus
+
+        if intf in intf_status:
+            profile = intf_status[intf].profileName
+
+        return profile
+
+    def on_initialized(self):
+        
+        pid = os.getpid()
+        if os.path.exists(LOGFILE):
+            os.remove(LOGFILE)
+        
+        os.symlink("/var/log/agents/MacsecEnableAgent-MacsecEnableAgent-%d" % pid, LOGFILE)
+       
+        # clear statuses
+        for item in self.agent_mgr.status_iter():
+            self.agent_mgr.status_del(item)
+
+        options = ["linecards", "macsec_profile"]
+        for option in options:
+            self.on_agent_option(option, self.agent_mgr.agent_option(option))
+        
+        self.watch_all_intfs(True)
+
+        Logging.log(SYS_EVENT_MACSECENABLER_INFO, "Agent inititialed")
+    
+    def on_agent_option(self, option, value):
+        """
+        Called when an agent option is changed from the Cli.
+        """
+
+        self.tracer.trace0("Agent configured: %s = '%s'" % (option, value))
+
+        linecards = []
+
+        if option == "linecards":
+            if not len(value):
+                value = DEFAULT_WATCH_LINECARDS
+            
+            elements = value.strip().split()
+            
+            for item in elements:
+                try:
+                    linecards.append(int(item))
+                except ValueError:
+                    self.idle = True
+                    Logging.log(SYS_EVENT_MACSECENABLER_ERROR, 
+                        "Invalid line card setting '%s', agent going idle" % str(value)) 
+                    return
+
+            
+            self.tracer.trace0("watching linecards: %s" % linecards)
+            self.watch_linecards = linecards
+
+        elif option == "macsec_profile":
+            if not len(value):
+                value = DEFAULT_MACSEC_PROFILE
+            self.tracer.trace0("Default Macsec profile set to: %s" % value)
+            self.macsec_profile = value
+
+        else:
+            # unknown option
+            pass
+
+    def on_agent_enabled(self, enabled):
+      if not enabled:
+         Logging.log(SYS_EVENT_MACSECENABLER_INFO, "Agent shutting down")
+         self.agent_mgr.agent_shutdown_complete_is(True)
+
+    def on_oper_status(self, intfid, oper_status):
+
+        intf_name = intfid.to_string()
+        linecard = None
+
+        if self.idle:
+            Logging.log(SYS_EVENT_MACSECENABLER_NOTICE, "Agent in IDLE state. Taking no action on interface %s" % intf_name)
+            return
+
+        _match = re.search(INTF_RE, intf_name)
+        if _match:
+            linecard = int(_match.group("linecard"))
+        else:
+            self.tracer.trace0("Skiping %s, did not match pattern" % intf_name)
+            return
+        
+        if linecard not in self.watch_linecards:
+            self.tracer.trace0("Skiping %s, linecard is not int watch list: %s" % (intf_name, str(self.watch_linecards)))
+            return
+
+        #intf_status = 'up' if oper_status == eossdk.INTF_OPER_UP else 'down'
+
+        profile = self._get_macsec_profile(intf_name)
+
+        if not profile and oper_status == eossdk.INTF_OPER_UP:
+            resp = self.eapi_mgr.run_config_cmds([
+                "interface %s" % intf_name,
+                "mac security profile %s" % self.macsec_profile
+            ])
+
+            if resp.error_code():
+                Logging.log(SYS_EVENT_MACSECENABLER_ERROR, "Error configuring %s: %s" % (intf_name, resp.error_message()))
+
+            # verify
+            profile = self._get_macsec_profile(intf_name)
+            if not profile:
+                Logging.log(SYS_EVENT_MACSECENABLER_WARN, "Failed to set %s MACsec profile to %s, traffic may be unecrypted" % (intf_name, profile))
+            else:
+                Logging.log(SYS_EVENT_MACSECENABLER_NOTICE, "Interface %s MACsec profile was unset, is now %s" % (intf_name, profile))
+        else:
+            self.tracer.trace0("Interface %s status changed, MACsec profile is %s" % (intf_name, profile))
+
+def main():
+    sdk = eossdk.Sdk()
+    _ = MacsecEnableAgent(sdk)
+    sdk.main_loop(sys.argv)
+
+if __name__ == "__main__":
+    main()
